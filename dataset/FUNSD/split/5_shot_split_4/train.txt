@@ -1,0 +1,5 @@
+training_data/images/660978.png
+training_data/images/80718412_8413.png
+training_data/images/0060024314.png
+training_data/images/91315069_91315070.png
+training_data/images/0001438955.png

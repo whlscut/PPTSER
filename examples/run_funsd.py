@@ -1,0 +1,777 @@
+#!/usr/bin/env python
+# coding=utf-8
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+from copy import deepcopy
+
+import numpy as np
+from datasets import ClassLabel, load_dataset, load_metric
+
+import transformers
+
+from layoutlmft.data import FewShotDataCollator # TODO
+from layoutlmft.models.layoutlmv3 import AutoModelForFSMethod
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    HfArgumentParser,
+    PreTrainedTokenizerFast,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
+from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from transformers.utils import check_min_version
+
+# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
+check_min_version("4.5.0")
+
+logger = logging.getLogger(__name__)
+from layoutlmft.data.utils.image_utils import RandomResizedCropAndInterpolationWithTwoPic, pil_loader, Compose
+
+from timm.data.constants import \
+    IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+from torchvision import transforms
+import torch
+
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
+    """
+
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
+    )
+    model_revision: str = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
+            "with private models)."
+        },
+    )
+
+
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    """
+
+    task_name: Optional[str] = field(default="ner", metadata={"help": "The name of the task (ner, pos...)."})
+    dataset_name: Optional[str] = field(
+        default='funsd', metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    dataset_config_name: Optional[str] = field(
+        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    train_file: Optional[str] = field(
+        default=None, metadata={"help": "The input training data file (a csv or JSON file)."}
+    )
+    validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate on (a csv or JSON file)."},
+    )
+    test_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input test data file to predict on (a csv or JSON file)."},
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of processes to use for the preprocessing."},
+    )
+    pad_to_max_length: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to pad all samples to model maximum sentence length. "
+            "If False, will pad the samples dynamically when batching to the maximum length in the batch. More "
+            "efficient on GPU but very bad for TPU."
+        },
+    )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        },
+    )
+    max_val_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of validation examples to this "
+            "value if set."
+        },
+    )
+    max_test_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "For debugging purposes or quicker training, truncate the number of test examples to this "
+            "value if set."
+        },
+    )
+    label_all_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to put the label for one word on all tokens of generated by that word or just on the "
+            "one (in which case the other tokens will have a padding index)."
+        },
+    )
+    return_entity_level_metrics: bool = field(
+        default=False,
+        metadata={"help": "Whether to return all the entity levels during evaluation or just the overall ones."},
+    )
+    prediction_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "directory to save the prediction result"}
+    )
+    segment_level_layout: bool = field(default=True)
+    visual_embed: bool = field(default=True)
+    data_dir: Optional[str] = field(default=None)
+    input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
+    second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
+    train_interpolation: str = field(
+        default='bicubic', metadata={"help": "Training interpolation (random, bilinear, bicubic)"})
+    second_interpolation: str = field(
+        default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
+    imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
+
+
+def main():
+    # See all possible arguments in layoutlmft/transformers/training_args.py
+    # or by passing the --help flag to this script.
+    # We now keep distinct sets of args, for a cleaner separation of concerns.
+    os.environ['TOKENIZERS_PARALLELISM'] = '(true | false)'
+
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # If we pass only one argument to the script and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # Detecting last checkpoint.
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
+
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
+
+    # Log on each process the small summary:
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    if is_main_process(training_args.local_rank):
+        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.enable_default_handler()
+        transformers.utils.logging.enable_explicit_format()
+    logger.info(f"Training/evaluation parameters {training_args}")
+
+    # Set seed before initializing model.
+    set_seed(training_args.seed)
+
+    import layoutlmft.data.dataset.funsd
+    datasets = load_dataset(os.path.abspath(layoutlmft.data.dataset.funsd.__file__),
+                            f"funsd",
+                            data_dir=data_args.data_dir,
+                            cache_dir=model_args.cache_dir)
+
+    if training_args.do_train:
+        column_names = datasets["train"].column_names
+        features = datasets["train"].features
+    else:
+        column_names = datasets["validation"].column_names
+        features = datasets["validation"].features
+
+    text_column_name = "words" if "words" in column_names else "tokens"
+
+    label_column_name = (
+        f"{data_args.task_name}_tags" if f"{data_args.task_name}_tags" in column_names else column_names[1]
+    )
+
+    remove_columns = column_names
+
+    # In the event the labels are not a `Sequence[ClassLabel]`, we will need to go through the dataset to get the
+    # unique labels.
+    def get_label_list(labels):
+        unique_labels = set()
+        for label in labels:
+            unique_labels = unique_labels | set(label)
+        label_list = list(unique_labels)
+        label_list.sort()
+        return label_list
+
+    if isinstance(features[label_column_name].feature, ClassLabel):
+        label_list = features[label_column_name].feature.names
+        label_list = label_list[::2]
+        label_list = [i.split("-")[-1] for i in label_list]
+        # No need to convert the labels since they are already ints.
+    else:
+        label_list = get_label_list(datasets["train"][label_column_name])
+    num_labels = len(label_list)
+    def bio_label_id_to_prompt_id(bio_label_id, mode):
+        if mode == "entity":
+            return int(((bio_label_id - 1) // 2) + 1)
+        elif mode == "bio":
+            if bio_label_id == 0:
+                return -100
+            elif bio_label_id % 2 == 1:
+                return 0
+            else:
+                return 1
+        else:
+            raise NotImplementedError
+
+    # Load pretrained model and tokenizer
+    #
+    # Distributed training:
+    # The .from_pretrained methods guarantee that only one local process can concurrently
+    # download model & vocab.
+    config = AutoConfig.from_pretrained(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=data_args.task_name,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        input_size=data_args.input_size,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
+    tokenizer = AutoTokenizer.from_pretrained( 
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        tokenizer_file=None,  # avoid loading from a cached file of the pre-trained model in another machine
+        cache_dir=model_args.cache_dir,
+        use_fast=True,
+        add_prefix_space=True,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
+
+    # add label prompts
+    label_prompt = ['{}'.format(i.lower()) \
+        for i in label_list if i != 'O' and i.upper() != 'OTHER']
+    label_prompt = ["none"] + label_prompt
+    label_prompt = label_prompt + ["beginning", "inner"]
+    tokenized_prompt = tokenizer(label_prompt)['input_ids']
+    tokenized_prompt = [tokenized_prompt[0][:-1]] + [i[1:-1] for i in tokenized_prompt[1:-1]] + [tokenized_prompt[-1][1:]]
+    len_of_tokenized_prompt = [len(i) for i in tokenized_prompt]
+    len_tokenized_prompt = [len(i) for i in tokenized_prompt]
+    # locate at <bos>
+    used_prompt_locate = (512 - 
+        torch.tensor(len_tokenized_prompt).flip(-1).cumsum(-1).flip(-1).long()).numpy().tolist()
+    # locate at {}
+    used_prompt_locate = [used_prompt_locate[i] - 1 + len_tokenized_prompt[i] for i in range(len(used_prompt_locate))]
+    used_prompt_locate[-1] = used_prompt_locate[-1] - 1
+
+    config.update({'len_of_all_tokenized_label': len_of_tokenized_prompt})
+    config.update({'label_head_locate': used_prompt_locate})
+
+    model = AutoModelForFSMethod.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
+
+    # Tokenizer check: this script requires a fast tokenizer.
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        raise ValueError(
+            "This example script only works for models that have a fast tokenizer. Checkout the big table of models "
+            "at https://huggingface.co/transformers/index.html#bigtable to find the model types that meet this "
+            "requirement"
+        )
+
+    # Preprocessing the dataset
+    # Padding strategy
+    padding = "max_length" if data_args.pad_to_max_length else False
+
+    if data_args.visual_embed:
+        imagenet_default_mean_and_std = data_args.imagenet_default_mean_and_std
+        mean = IMAGENET_INCEPTION_MEAN if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_MEAN
+        std = IMAGENET_INCEPTION_STD if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_STD
+        common_transform = Compose([
+            # transforms.ColorJitter(0.4, 0.4, 0.4),
+            # transforms.RandomHorizontalFlip(p=0.5),
+            RandomResizedCropAndInterpolationWithTwoPic(
+                size=data_args.input_size, interpolation=data_args.train_interpolation),
+        ])
+
+        patch_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=torch.tensor(mean),
+                std=torch.tensor(std))
+        ])
+
+    # Tokenize all texts and align the labels with them.
+    def tokenize_and_align_labels(examples, augmentation=False):
+        tokenized_inputs = tokenizer(
+            examples[text_column_name],
+            padding=False,
+            truncation=True,
+            return_overflowing_tokens=True,
+            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
+            is_split_into_words=True,
+            max_length=512 - sum(len_of_tokenized_prompt),
+        )
+
+        labels = []
+        bboxes = []
+        images = []
+        sub_word_belongs_to_seg = []
+        for batch_index in range(len(tokenized_inputs["input_ids"])):
+            word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
+            org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
+
+            label = examples[label_column_name][org_batch_index]
+            bbox = examples["bboxes"][org_batch_index]
+            word_belongs_to_seg = examples['word_belongs_to_seg'][org_batch_index]
+            previous_word_idx = None
+            label_ids = [[], []]
+            bbox_inputs = []
+            sub_word_in_sample_belongs_to_seg = []
+            for word_idx in word_ids:
+                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
+                # ignored in the loss function.
+                if word_idx is None:
+                    label_ids[0].append(-100)
+                    label_ids[1].append(-100)
+                    bbox_inputs.append([0, 0, 0, 0])
+                    sub_word_in_sample_belongs_to_seg.append(-1)
+                # We set the label for the first token of each word.
+                elif word_idx != previous_word_idx:
+                    label_ids[0].append(bio_label_id_to_prompt_id(label[word_idx], "entity"))
+                    label_ids[1].append(bio_label_id_to_prompt_id(label[word_idx], "bio"))
+                    bbox_inputs.append(bbox[word_idx])
+                    sub_word_in_sample_belongs_to_seg.append(word_belongs_to_seg[word_idx])
+                # For the other tokens in a word, we set the label to either the current label or -100, depending on
+                # the label_all_tokens flag.
+                else:
+                    label_ids[0].append(bio_label_id_to_prompt_id(label[word_idx], "entity")
+                                        if data_args.label_all_tokens else -100)
+                    label_ids[1].append(bio_label_id_to_prompt_id(label[word_idx], "bio")
+                                        if data_args.label_all_tokens else -100)
+                    bbox_inputs.append(bbox[word_idx])
+                    sub_word_in_sample_belongs_to_seg.append(word_belongs_to_seg[word_idx])
+                previous_word_idx = word_idx
+            labels.append(label_ids)
+            bboxes.append(bbox_inputs)
+            sub_word_belongs_to_seg.append(sub_word_in_sample_belongs_to_seg)
+
+            if data_args.visual_embed:
+                ipath = examples["image_path"][org_batch_index]
+                img = pil_loader(ipath)
+                for_patches, _ = common_transform(img, augmentation=augmentation)
+                patch = patch_transform(for_patches)
+                images.append(patch)
+
+        tokenized_inputs["labels"] = labels
+        tokenized_inputs["bbox"] = bboxes
+        tokenized_inputs["images"] = images
+        # tokenized_inputs["sub_word_belongs_to_seg"] = sub_word_belongs_to_seg
+
+        return tokenized_inputs
+
+    def tokenize_and_align_labels_for_prediction(examples, augmentation=False):
+        tokenized_inputs = tokenizer(
+            examples[text_column_name],
+            padding=False,
+            truncation=True,
+            return_overflowing_tokens=True,
+            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
+            is_split_into_words=True,
+            max_length=512 - sum(len_of_tokenized_prompt),
+        )
+
+        labels = []
+        bboxes = []
+        images = []
+        sub_word_belongs_to_seg = []
+        examples["file_name"] = []
+        os.makedirs(data_args.prediction_dir, exist_ok=True)
+        os.makedirs(os.path.join(data_args.prediction_dir, "tokenized_words"))
+        os.makedirs(os.path.join(data_args.prediction_dir, "predictions"))
+
+        for batch_index in range(len(tokenized_inputs["input_ids"])):
+            word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
+            org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
+
+            label = examples[label_column_name][org_batch_index]
+            bbox = examples["bboxes"][org_batch_index]
+            word_belongs_to_seg = examples['word_belongs_to_seg'][org_batch_index]
+            previous_word_idx = None
+            label_ids = [[], []]
+            bbox_inputs = []
+            sub_word_in_sample_belongs_to_seg = []
+
+            # write tokenized word
+            slice = 0
+            file_name = examples["image_path"][org_batch_index].split("/")[-1].split(".")[0] + "_" + str(slice) + ".txt"
+            while os.path.exists(os.path.join(data_args.prediction_dir, "tokenized_words", file_name)):
+                slice += 1
+                file_name = examples["image_path"][org_batch_index].split("/")[-1].split(".")[0] + "_" + str(slice) + ".txt"
+            examples["file_name"].append(file_name)
+
+            with open(os.path.join(data_args.prediction_dir, "tokenized_words", file_name), "w") as f:
+                for input_ids_index, word_idx in enumerate(word_ids):
+                    # Special tokens have a word id that is None. We set the label to -100 so they are automatically
+                    # ignored in the loss function.
+                    if word_idx is None:
+                        label_ids[0].append(-100)
+                        label_ids[1].append(-100)
+                        bbox_inputs.append([0, 0, 0, 0])
+                        sub_word_in_sample_belongs_to_seg.append(-1)
+                    # We set the label for the first token of each word.
+                    elif word_idx != previous_word_idx:
+                        label_ids[0].append(bio_label_id_to_prompt_id(label[word_idx], "entity"))
+                        label_ids[1].append(bio_label_id_to_prompt_id(label[word_idx], "bio"))
+                        bbox_inputs.append(bbox[word_idx])
+                        sub_word_in_sample_belongs_to_seg.append(word_belongs_to_seg[word_idx])
+                        # write tokenized word
+                        if input_ids_index > 1:
+                            f.write("\n")
+                        f.write(tokenizer._convert_id_to_token(tokenized_inputs["input_ids"][batch_index][input_ids_index]))
+                    # For the other tokens in a word, we set the label to either the current label or -100, depending on
+                    # the label_all_tokens flag.
+                    else:
+                        label_ids[0].append(bio_label_id_to_prompt_id(label[word_idx], "entity")
+                                            if data_args.label_all_tokens else -100)
+                        label_ids[1].append(bio_label_id_to_prompt_id(label[word_idx], "bio")
+                                            if data_args.label_all_tokens else -100)
+                        bbox_inputs.append(bbox[word_idx])
+                        sub_word_in_sample_belongs_to_seg.append(word_belongs_to_seg[word_idx])
+                        # write tokenized word
+                        if data_args.label_all_tokens:
+                            f.write("\n")
+                        f.write(tokenizer._convert_id_to_token(tokenized_inputs["input_ids"][batch_index][input_ids_index]))
+                    previous_word_idx = word_idx
+                labels.append(label_ids)
+                bboxes.append(bbox_inputs)
+                sub_word_belongs_to_seg.append(sub_word_in_sample_belongs_to_seg)
+
+            if data_args.visual_embed:
+                ipath = examples["image_path"][org_batch_index]
+                img = pil_loader(ipath)
+                for_patches, _ = common_transform(img, augmentation=augmentation)
+                patch = patch_transform(for_patches)
+                images.append(patch)
+
+        tokenized_inputs["labels"] = labels
+        tokenized_inputs["bbox"] = bboxes
+        tokenized_inputs["images"] = images
+        tokenized_inputs["sub_word_belongs_to_seg"] = sub_word_belongs_to_seg
+
+        return tokenized_inputs
+
+    if training_args.do_train:
+        if "train" not in datasets:
+            raise ValueError("--do_train requires a train dataset")
+        train_dataset = datasets["train"]
+        if data_args.max_train_samples is not None:
+            train_dataset = train_dataset.select(range(data_args.max_train_samples))
+        train_dataset = train_dataset.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+
+    if training_args.do_eval:
+        validation_name = "validation"
+        if validation_name not in datasets:
+            raise ValueError("--do_eval requires a validation dataset")
+        eval_dataset = datasets[validation_name]
+        if data_args.max_val_samples is not None:
+            eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
+        eval_dataset = eval_dataset.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+
+    if training_args.do_predict:
+        if "test" not in datasets:
+            raise ValueError("--do_predict requires a test dataset")
+        test_dataset = datasets["test"]
+        if data_args.max_test_samples is not None:
+            test_dataset = test_dataset.select(range(data_args.max_test_samples))
+        test_dataset = test_dataset.map(
+            tokenize_and_align_labels_for_prediction,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+
+    # Data collator
+    data_collator = FewShotDataCollator(
+        tokenizer=tokenizer,
+        pad_to_multiple_of=8 if training_args.fp16 else None,
+        padding=padding,
+        max_length=512,
+        tokenized_label=tokenized_prompt,
+    )
+
+    # Metrics
+    metric = load_metric("metrics/seqeval.py")
+
+    def compute_metrics(p, label_list=label_list):
+        predictions, labels = p
+        predictions_filed = np.argmax(predictions[..., :-2], axis=2)
+        predictions_bio = np.argmax(predictions[..., -2:], axis=2)
+        labels_field = labels[:, 0, :]
+        labels_bio = labels[:, 1, :]
+
+        # Remove ignored index (special tokens)
+        field_posibility = [
+            [p for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions[..., :-3], labels_field)
+        ]
+
+        bio_posibility = [
+            [p for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions[..., -3:], labels_field)
+        ]
+
+        true_predictions_field = [
+            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions_filed, labels_field)
+        ]
+        true_predictions_bio = [
+            ["B" if p == 0 else "I" if p ==1 else "O" for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions_bio, labels_field)
+        ]
+        true_labels_filed = [
+            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions_filed, labels_field)
+        ]
+        true_labels_bio = [
+            ["B" if p == 0 else "I" if p == 1 else -10 for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(labels_bio, labels_field)
+        ]
+
+        true_predictions = []
+        true_labels = []
+        for i in range(len(true_predictions_field)):
+            true_prediction = []
+            true_label = []
+            for j in range(len(true_predictions_field[i])):
+                if true_predictions_field[i][j] != "O":
+                    true_prediction.append("{}-{}".format(
+                        true_predictions_bio[i][j],
+                        true_predictions_field[i][j]
+                    ))
+                else:
+                    true_prediction.append(true_predictions_field[i][j])
+                
+                if true_labels_filed[i][j] != "O":
+                    true_label.append("{}-{}".format(
+                        true_labels_bio[i][j],
+                        true_labels_filed[i][j]
+                    ))
+                else:
+                    true_label.append(true_labels_filed[i][j])
+            true_predictions.append(true_prediction)
+            true_labels.append(true_label)
+
+        true_predictions_filtered = deepcopy(true_predictions)
+        for i in range(len(true_predictions)):
+            pre = "O"
+            for j in range(len(true_predictions[i])):
+                if true_predictions_filtered[i][j].startswith("I-") and \
+                    true_predictions_filtered[i][j].split("-")[-1] != pre:
+                    true_predictions_filtered[i][j] = "O"
+                pre = true_predictions_filtered[i][j].split("-")[-1]
+
+        results = metric.compute(predictions=true_predictions_filtered, references=true_labels)
+
+        print("field level metrics")
+        for field_name in label_list:
+            if field_name != "O":
+                print(field_name, results["detail"][field_name])
+        
+        print("macro level metrics")
+        print(results["detail"]['macro avg'])
+        print("weighted avg")
+        print(results["detail"]['weighted avg'])
+
+        if data_args.return_entity_level_metrics:
+            # Unpack nested dictionaries
+            final_results = {}
+            for key, value in results.items():
+                if isinstance(value, dict):
+                    for n, v in value.items():
+                        final_results[f"{key}_{n}"] = v
+                else:
+                    final_results[key] = value
+            return final_results
+        else:
+            return {
+                "precision": results["overall_precision"],
+                "recall": results["overall_recall"],
+                "f1": results["overall_f1"],
+                "accuracy": results["overall_accuracy"],
+            }
+
+    # Initialize our Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+
+    # Training
+    if training_args.do_train:
+        checkpoint = last_checkpoint if last_checkpoint else None
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        metrics = train_result.metrics
+        trainer.save_model()  # Saves the tokenizer too for easy upload
+
+        max_train_samples = (
+            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+        )
+        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+
+    # Evaluation
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+
+        metrics = trainer.evaluate()
+
+        max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
+        metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))
+
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
+    # Predict
+    if training_args.do_predict:
+        logger.info("*** Predict ***")
+
+        predictions, labels, metrics = trainer.predict(test_dataset)
+
+        predictions_filed = np.argmax(predictions[..., :-2], axis=2)
+        predictions_bio = np.argmax(predictions[..., -2:], axis=2)
+        labels_field = labels[:, 0, :]
+        labels_bio = labels[:, 1, :]
+
+        # Remove ignored index (special tokens)
+        true_predictions_field = [
+            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions_filed, labels_field)
+        ]
+        true_predictions_bio = [
+            ["B" if p == 0 else "I" for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions_bio, labels_field)
+        ]
+        true_labels_filed = [
+            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions_filed, labels_field)
+        ]
+        true_labels_bio = [
+            ["B" if p == 0 else "I" if p == 1 else -10 for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(labels_bio, labels_field)
+        ]
+
+        true_predictions = []
+        true_labels = []
+        for i in range(len(true_predictions_field)):
+            true_prediction = []
+            true_label = []
+            for j in range(len(true_predictions_field[i])):
+                if true_predictions_field[i][j] != "O":
+                    true_prediction.append("{}-{}".format(
+                        true_predictions_bio[i][j],
+                        true_predictions_field[i][j]
+                    ))
+                else:
+                    true_prediction.append(true_predictions_field[i][j])
+                
+                if true_labels_filed[i][j] != "O":
+                    true_label.append("{}-{}".format(
+                        true_labels_bio[i][j],
+                        true_labels_filed[i][j]
+                    ))
+                else:
+                    true_label.append(true_predictions_field[i][j])
+            true_predictions.append(true_prediction)
+            true_labels.append(true_label)
+
+        true_predictions_filtered = deepcopy(true_predictions)
+        for i in range(len(true_predictions)):
+            pre = "O"
+            for j in range(len(true_predictions[i])):
+                if true_predictions_filtered[i][j].startswith("I-") and \
+                    true_predictions_filtered[i][j].split("-")[-1] != pre:
+                    true_predictions_filtered[i][j] = "O"
+                pre = true_predictions_filtered[i][j].split("-")[-1]
+        true_predictions = true_predictions_filtered
+
+        for i in range(len(true_predictions)):
+            with open(os.path.join(data_args.prediction_dir, "predictions", test_dataset["file_name"][i]), 'a') as f:
+                for j in range(len(true_predictions[i])):
+                    f.write(true_predictions[i][j])
+                    if j != len(true_predictions[i]) - 1:
+                        f.write('\n')
+
+        trainer.log_metrics("test", metrics)
+        trainer.save_metrics("test", metrics)
+
+
+def _mp_fn(index):
+    # For xla_spawn (TPUs)
+    main()
+
+
+if __name__ == "__main__":
+    main()
