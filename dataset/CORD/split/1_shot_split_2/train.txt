@@ -1,0 +1,9 @@
+train/image/receipt_00327.png
+train/image/receipt_00749.png
+train/image/receipt_00569.png
+train/image/receipt_00794.png
+train/image/receipt_00617.png
+train/image/receipt_00328.png
+train/image/receipt_00182.png
+train/image/receipt_00674.png
+train/image/receipt_00716.png
